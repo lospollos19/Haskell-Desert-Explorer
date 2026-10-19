@@ -1,40 +1,30 @@
-{-# LANGUAGE ParallelListComp #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DataKinds #-}
-{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
-
-
-module  Game where
-import Graphics.Gloss
-import Graphics.Gloss.Interface.Pure.Game (Event(..), Key(..), SpecialKey(..), KeyState(..))
-import Graphics.Gloss.Interface.IO.Game (playIO)
-import System.Exit (exitSuccess)
-import System.IO.Unsafe (unsafePerformIO)
-import Data.Char (isAlphaNum, toUpper)
-import Control.Monad (unless)
-import Text.Read (readMaybe)
-import System.Random (mkStdGen, randomR)
-import Control.Concurrent (getNumCapabilities)
-import System.Environment (getArgs)
-import Control.Concurrent.STM (TVar, readTVar, writeTVar, atomically, newTVarIO, readTVarIO)
-
-
-
 
 {-
-
-                                       TITLE : Desert Explorer                                   
+                                       TITLE : Desert Explorer
     Name : Moussa Tallih
     Course : Functional Programming
     Date : 03/06/2025
 -}
 
+module Game where
+
+import qualified Data.Set as Set
+import Data.Sequence (Seq, ViewL(..), viewl, (|>))
+import qualified Data.Sequence as Seq
+import System.Random (mkStdGen, randomR)
+
 
 -- Constants
+
 waterPerMove :: Int
 waterPerMove = 5
+
+-- Maximum distance the magic compass searches (the map is infinite)
+compassRange :: Int
+compassRange = 30
 
 type Command = String
 
@@ -45,57 +35,52 @@ class GameState s where
     isWinState :: s -> Bool
     isFinalState :: s -> Bool
 
--- To "boot" a terminal-based game, we use a type s to represent game state and a type c to represent game configuration, where ...
+-- To "boot" a game, we use a type s to represent game state and a type c to represent game configuration, where ...
 -- ... we can compute an initial game state s using a given configuration c (which can fail if the configuration is invalid)
 class GameState s => TerminalGame s c | c -> s where
     initialState :: c -> Either String s
 
--- 
--- Desert Explorer 
--- 
+--
+-- Desert Explorer
+--
 
--- Types used 
+-- Types used
 
 type Position = (Int, Int)
 
 data GameTile = Desert | Treasure | Water | Portal | Lava deriving (Show, Eq)
 
+type GameMap = [[(GameTile, Position)]]
+
 
 -- Parse tool
 
-readMaybe' :: String -> Maybe Char
-readMaybe' ['A'] = Just 'A'
-readMaybe' ['D'] = Just 'D'
-readMaybe' ['W'] = Just 'W'
-readMaybe' ['S'] = Just 'S'
-readMaybe' _ = Nothing
+readMove :: String -> Maybe Char
+readMove [c] | c `elem` "WASD" = Just c
+readMove _ = Nothing
 
 -- Map tools
-
 
 updateAt :: Int -> a -> [a] -> [a]
 updateAt i newVal xs = take i xs ++ [newVal] ++ drop (i + 1) xs
 
-setGameTile :: Position -> GameTile -> [[(GameTile, Position)]] -> [[(GameTile, Position)]]
-setGameTile (x, y) newTile gameMap =
-  updateAt y newRow gameMap
+setGameTile :: Position -> GameTile -> GameMap -> GameMap
+setGameTile (x, y) newTile gameMap = updateAt y newRow gameMap
   where
     row = gameMap !! y
-    (oldTile, pos) = row !! x
+    (_, pos) = row !! x
     newRow = updateAt x (newTile, pos) row
 
+getCell :: Position -> GameMap -> (GameTile, Position)
+getCell (x, y) gameMap = gameMap !! y !! x
 
-getCell :: Position -> [[(GameTile, Position)]] ->  (GameTile, Position)
-getCell (x, y) gameMap =
-  let row = getRow y gameMap
-  in row !! x
+tileAt :: Position -> GameMap -> GameTile
+tileAt pos = fst . getCell pos
 
-getRow :: Int -> [[(GameTile, Position)]] ->  [(GameTile, Position)]
-getRow = flip (!!)
-
----  
+---
 ----- Tools to Show
 ---
+
 getWindowBounds :: Position -> Int -> (Int, Int, Int, Int)
 getWindowBounds (px, py) vision =
   let minX = max 0 (px - vision)
@@ -104,8 +89,7 @@ getWindowBounds (px, py) vision =
       maxY = minY + 2 * vision
   in (minX, maxX, minY, maxY)
 
-
-getVisibleZone :: [[(GameTile, Position)]] -> Position -> Int -> [[(GameTile, Position)]]
+getVisibleZone :: GameMap -> Position -> Int -> GameMap
 getVisibleZone grid (px, py) vision =
   let (minX, maxX, minY, maxY) = getWindowBounds (px, py) vision
   in [ [ grid !! y !! x | x <- [minX .. maxX] ] | y <- [minY .. maxY] ]
@@ -122,48 +106,52 @@ renderCell playerPos (tile, pos)
   | pos == playerPos = '@'
   | otherwise        = tileChar tile
 
-renderMap :: [[(GameTile, Position)]] -> Position -> Int -> String
+renderMap :: GameMap -> Position -> Int -> String
 renderMap grid playerPos vision =
   let visible = getVisibleZone grid playerPos vision
   in unlines [ [ renderCell playerPos cell | cell <- row ] | row <- visible ]
 
+showDistance :: Maybe Int -> String
+showDistance = maybe ("> " ++ show compassRange) show
+
 ---
 
 
--- Desert Explorer Game Configuration and State 
+-- Desert Explorer Game Configuration and State
 
 data DesertExplorerConfig = DesertExplorerConfig { sight :: Int, maxWaterCapacity :: Int , seedG :: Int,
                                                     treasureChance :: Int,   waterChance :: Int, portalChance :: Int,
                                                     singleLavaChance :: Int, surroundedLavaChance :: Int}
 
-data DesertExplorerGameState = DesertExplorerGameState { playerPos :: Position, water::Int,
-                                                         desert :: [[(GameTile,Position)]], treasureNbr :: Int,
-                                                         waterBound :: Int, nearestWater::Int,
-                                                          nearestPortal::Int, nearestDesert :: Int, vision :: Int}
+data DesertExplorerGameState = DesertExplorerGameState { playerPos :: Position, water :: Int,
+                                                         desert :: GameMap, treasureNbr :: Int,
+                                                         waterBound :: Int, nearestWater :: Maybe Int,
+                                                         nearestPortal :: Maybe Int, nearestDesert :: Maybe Int,
+                                                         vision :: Int }
 
 instance GameState DesertExplorerGameState where
-    nextState st input = fmap (doAction st) (readMaybe' input)
-    isLooseWaterState DesertExplorerGameState { water = waterStock, ..} = waterStock <= 0
-    isLooseWaterState _ = False
-    isLooseLavaState DesertExplorerGameState {playerPos = currentPos, desert = gameMap, ..} = isLava currentPos gameMap
-    isLooseLavaState _ = False
-    isWinState DesertExplorerGameState {playerPos = currentPos, desert = gameMap, ..} = isPortal currentPos gameMap
-    isWinState _ = False
-    isFinalState s = isLooseLavaState s || isLooseWaterState s  || isWinState s
+    nextState st input = fmap (doAction st) (readMove input)
+    isLooseWaterState st = water st <= 0
+    isLooseLavaState st = isLava (playerPos st) (desert st)
+    isWinState st = isPortal (playerPos st) (desert st)
+    isFinalState s = isLooseLavaState s || isLooseWaterState s || isWinState s
 
 instance TerminalGame DesertExplorerGameState DesertExplorerConfig where
     initialState config@DesertExplorerConfig{..}
-        | w + p + l >= 100 = Left "Invalid configuration: w + p + l > 100"
-        | w  + p + ll >= 100 = Left "Invalid configuration: w + p + ll > 100"
-        | otherwise =  Right $ DesertExplorerGameState (0,0) maxWaterCapacity gameMap 0 maxWaterCapacity 0 0 0 sight
+        | any (< 0) [treasureChance, waterChance, portalChance, singleLavaChance, surroundedLavaChance] =
+            Left "Invalid configuration: chances must be positive"
+        | treasureChance > 100 = Left "Invalid configuration: t > 100"
+        | sight < 0 = Left "Invalid configuration: sight must be positive"
+        | maxWaterCapacity <= 0 = Left "Invalid configuration: water capacity must be > 0"
+        | w + p + l > 100 = Left "Invalid configuration: w + p + l > 100"
+        | w + p + ll > 100 = Left "Invalid configuration: w + p + ll > 100"
+        | otherwise = Right $ magicCompass $
+            DesertExplorerGameState (0, 0) maxWaterCapacity (generateMap config) 0 maxWaterCapacity
+                                    Nothing Nothing Nothing sight
         where w = waterChance
               p = portalChance
               l = singleLavaChance
               ll = surroundedLavaChance
-              gameMap = [[ if (x, y) == (0, 0)
-                            then (Desert, (0, 0))
-                            else tempGenGameTile config (x, y)
-                        | x <- [0..]] | y <- [0..]]
 
 
 instance Show DesertExplorerGameState where
@@ -176,134 +164,141 @@ instance Show DesertExplorerGameState where
         , "Player position    : " ++ show playerPos
         , "Remaining water    : " ++ show water
         , "Treasures found    : " ++ show treasureNbr
-        , "Nearest water      : " ++ show nearestWater
-        , "Nearest portal     : " ++ show nearestPortal
-        , "Nearest desert     : " ++ show nearestDesert
+        , "Nearest water      : " ++ showDistance nearestWater
+        , "Nearest portal     : " ++ showDistance nearestPortal
+        , "Nearest desert     : " ++ showDistance nearestDesert
         ]
 
--- 
+--
 
--- Map Generation Tools 
+-- Map Generation Tools
 
-desertOrTreasure :: Int ->  Position  -> Int -> GameTile
-desertOrTreasure treasureChance (x,y) seed
-    | treasureChance > chance = Treasure
-    | otherwise = Desert
-    where
-        seedUp = seed  + x * 100 + y
-        (chance,_) = randomR (1, 100) (mkStdGen seedUp)
+-- Unique seed per tile (Cantor pairing of the coordinates, mixed with the global seed)
+tileSeed :: Int -> Position -> Int
+tileSeed seed (x, y) = seed * 1000003 + (x + y) * (x + y + 1) `div` 2 + y
 
-
-tempGenGameTile :: DesertExplorerConfig -> Position -> (GameTile, Position)
-tempGenGameTile config pos@(x, y)
-    | chance <=  w = (Water, pos)
-    | chance <=  w + p = (Portal, pos)
-    | chance <=  w + p + l = (Lava, pos)
-    | chance <=  w + p + l + ll = (Lava, pos)
-    | otherwise = (desertOrTreasure t pos seed, pos)
+-- The map is generated lazily, row by row and left to right. Each tile knows the tile above it and
+-- the tile to its left, so the lava chance can depend on whether lava is already adjacent.
+generateMap :: DesertExplorerConfig -> GameMap
+generateMap config = rows
   where
-    t = treasureChance config
-    w = waterChance config
-    p = portalChance config
-    l = singleLavaChance config
-    ll = surroundedLavaChance config
-    seed = seedG config + x * 100 + y
-    (chance, _) = randomR (1, 100) (mkStdGen seed)
+    rows = zipWith genRow [0 ..] (repeat Nothing : map (map (Just . fst)) rows)
+    genRow y ups = row
+      where
+        row = zipWith3 (genTile y) [0 ..] ups lefts
+        lefts = Nothing : map (Just . fst) row
+    genTile y x up left
+      | (x, y) == (0, 0) = (Desert, (0, 0))
+      | otherwise = (genGameTile config (x, y) (Just Lava `elem` [up, left]), (x, y))
 
--- 
+genGameTile :: DesertExplorerConfig -> Position -> Bool -> GameTile
+genGameTile DesertExplorerConfig{..} pos lavaAdjacent
+    | chance <= w = Water
+    | chance <= w + p = Portal
+    | chance <= w + p + lavaChance = Lava
+    | treasureRoll <= treasureChance = Treasure
+    | otherwise = Desert
+  where
+    w = waterChance
+    p = portalChance
+    lavaChance = if lavaAdjacent then surroundedLavaChance else singleLavaChance
+    (chance, gen) = randomR (1, 100 :: Int) (mkStdGen (tileSeed seedG pos))
+    (treasureRoll, _) = randomR (1, 100 :: Int) gen
+
+--
 
 
 -- Check if a position is of a specific tile type
 
-isLava :: (Int, Int) -> [[(GameTile, Position)]] -> Bool
-isLava (x, y) gameMap = (== Lava) . fst $ (gameMap !! y !! x)
+isLava :: Position -> GameMap -> Bool
+isLava pos gameMap = tileAt pos gameMap == Lava
 
-isPortal :: (Int, Int) -> [[(GameTile, Position)]] -> Bool
-isPortal (x, y) gameMap = (== Portal) . fst $ (gameMap !! y !! x)
+isPortal :: Position -> GameMap -> Bool
+isPortal pos gameMap = tileAt pos gameMap == Portal
 
-isWater :: (Int, Int) -> [[(GameTile, Position)]] -> Bool
-isWater (x, y) gameMap = (== Water) . fst $ (gameMap !! y !! x)
+isWater :: Position -> GameMap -> Bool
+isWater pos gameMap = tileAt pos gameMap == Water
 
-isDesert :: (Int, Int) -> [[(GameTile, Position)]] -> Bool
-isDesert (x, y) gameMap = (== Desert) . fst $ (gameMap !! y !! x)
+isDesert :: Position -> GameMap -> Bool
+isDesert pos gameMap = tileAt pos gameMap == Desert
 
 -- Movement tools
 
-goDown :: Position -> Position
-goDown (x,y) = (x, y+1)
+outOfMap :: String
+outOfMap = "You can't leave the map"
 
-goUp:: Position -> Either String Position
-goUp (x, y) = if y -1 < 0
-                then Left "Vous essayez de sortir des limites de la map"
-                else Right (x, y-1)
+goDown :: Position -> Either String Position
+goDown (x, y) = Right (x, y + 1)
+
+goUp :: Position -> Either String Position
+goUp (x, y)
+  | y - 1 < 0 = Left outOfMap
+  | otherwise = Right (x, y - 1)
 
 goLeft :: Position -> Either String Position
-goLeft (x, y) = if x -1 < 0
-                then Left "Vous essayez de sortir des limites de la map"
-                else Right (x-1, y)
+goLeft (x, y)
+  | x - 1 < 0 = Left outOfMap
+  | otherwise = Right (x - 1, y)
 
-goRight :: Position -> Position
-goRight (x, y) = (x+1, y)
+goRight :: Position -> Either String Position
+goRight (x, y) = Right (x + 1, y)
 
 movePlayer :: Char -> Position -> Either String Position
-movePlayer 'W' pos = goUp pos
-movePlayer 'S' pos = Right $ goDown pos
-movePlayer 'D' pos = Right $ goRight pos
-movePlayer 'A' pos = goLeft pos
+movePlayer 'W' = goUp
+movePlayer 'S' = goDown
+movePlayer 'D' = goRight
+movePlayer 'A' = goLeft
+movePlayer c   = const (Left ("Unknown move: " ++ [c]))
+
 --
 
 -- Game Logic
 
-doEventTile currentState@DesertExplorerGameState{playerPos, desert, treasureNbr} Treasure =
-    currentState { treasureNbr = treasureNbr + 1, desert = newMap}
-  where
-    newMap = setGameTile playerPos Desert desert
+doEventTile :: DesertExplorerGameState -> GameTile -> DesertExplorerGameState
+doEventTile st Treasure =
+    st { treasureNbr = treasureNbr st + 1, desert = setGameTile (playerPos st) Desert (desert st) }
+doEventTile st Water = st { water = waterBound st }
+doEventTile st _ = st
 
-doEventTile currentState@DesertExplorerGameState{water, waterBound} Water =
-    currentState { water = waterBound }
-
-doEventTile currentState _  = currentState
-
-
-doEvent currentState = doEventTile  currentState tileType
-                        where (tileType,_) = getCell (playerPos currentState) (desert currentState)
-
-
+doEvent :: DesertExplorerGameState -> DesertExplorerGameState
+doEvent st = doEventTile st (tileAt (playerPos st) (desert st))
 
 doAction :: DesertExplorerGameState -> Char -> Either String DesertExplorerGameState
-doAction currentState input =
-  case movePlayer input (playerPos currentState) of
-    Left err -> Left err
-    Right newPos ->
-      let tempState = currentState { playerPos = newPos, water = water currentState - waterPerMove }
-          tempState2 = doEvent tempState
-          newState = magicCompass tempState2
-      in Right newState
+doAction currentState input = do
+  newPos <- movePlayer input (playerPos currentState)
+  let moved = currentState { playerPos = newPos, water = water currentState - waterPerMove }
+  return $ magicCompass (doEvent moved)
+
 --
 
--- Magic Compass / BFS Algorithm (Not really Working unfortunately)
+-- Magic Compass / BFS Algorithm
 
-magicCompass currentState@DesertExplorerGameState{nearestWater, nearestPortal, nearestDesert} =
-  let newNearestWater = bfs (desert currentState) [playerPos currentState] [] isWater
-      newNearestPortal = bfs (desert currentState) [playerPos currentState] [] isPortal
-      newNearestDesert = bfs (desert currentState) [playerPos currentState] [] isDesert
-  in currentState { nearestWater = length newNearestWater, nearestPortal = length newNearestPortal, nearestDesert = length newNearestDesert }
+magicCompass :: DesertExplorerGameState -> DesertExplorerGameState
+magicCompass st =
+  st { nearestWater  = distanceTo isWater
+     , nearestPortal = distanceTo isPortal
+     , nearestDesert = distanceTo isDesert
+     }
+  where distanceTo = bfs (desert st) (playerPos st)
 
 getNeighbors :: Position -> [Position]
 getNeighbors (x, y) =
   filter (\(nx, ny) -> nx >= 0 && ny >= 0)
     [(x-1, y), (x+1, y), (x, y-1), (x, y+1)]
 
-bfs :: [[(GameTile, Position)]]
-    -> [Position]
-    -> [Position]
-    -> (Position -> [[(GameTile, Position)]] -> Bool)
-    -> [Position]
-bfs _ [] _ _ = []
-bfs grid (p:ps) visited cond
-  | p `elem` visited = bfs grid ps visited cond
-  | isLava p grid = bfs grid ps (p : visited) cond  -- 
-  | cond p grid = p : visited
-  | otherwise =
-      let next = filter (`notElem` visited) (getNeighbors p)
-      in bfs grid (ps ++ next) (p : visited) cond
+-- Number of moves to the nearest tile (other than the current one) satisfying cond,
+-- without walking through lava. Nothing when no such tile is within compassRange.
+bfs :: GameMap -> Position -> (Position -> GameMap -> Bool) -> Maybe Int
+bfs grid start cond = go (Seq.singleton (start, 0)) (Set.singleton start)
+  where
+    go :: Seq (Position, Int) -> Set.Set Position -> Maybe Int
+    go queue visited = case viewl queue of
+      EmptyL -> Nothing
+      (p, d) :< rest
+        | p /= start && cond p grid -> Just d
+        | d >= compassRange -> go rest visited
+        | otherwise ->
+            let next = [ n | n <- getNeighbors p, Set.notMember n visited, not (isLava n grid) ]
+                visited' = foldr Set.insert visited next
+                queue' = foldl (|>) rest [ (n, d + 1) | n <- next ]
+            in go queue' visited'
