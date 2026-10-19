@@ -6,6 +6,31 @@ water, lava kills you, and stepping on a portal gets you out.
 
 The game has a graphical mode (Gloss) and a terminal mode.
 
+![Desert Explorer GUI](docs/gameplay.png)
+
+The same position in terminal mode:
+
+```
+.........TL
+..........L
+...T....W..
+.T..@.LWW..
+.W.P....PP.
+.T.TT......
+.P...W.W.P.
+.....W.....
+.T..L.LW...
+....L.W....
+........WL.
+
+Player position    : (4,3)
+Remaining water    : 65
+Treasures found    : 1
+Nearest water      : 4
+Nearest portal     : 2
+Nearest desert     : 1
+```
+
 ## Build and run
 
 You need GHC and cabal (for example via [GHCup](https://www.haskell.org/ghcup/)).
